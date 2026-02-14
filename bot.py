@@ -262,10 +262,6 @@ async def ticket_panel(interaction: discord.Interaction):
 # =========================
 @bot.event
 async def on_ready():
-    bot.add_view(TicketPanelView())
-    bot.add_view(ReopenView())
-    bot.add_view(CloseButtonView())
-
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
