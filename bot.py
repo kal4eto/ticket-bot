@@ -246,11 +246,11 @@ async def ticket_panel(interaction: discord.Interaction):
     )
 
     embed.set_thumbnail(
-        url="https://cdn.discordapp.com/attachments/1430717412944248872/1472312218543456419/af_tickets.png"
+        url="https://cdn.discordapp.com/attachments/1430717412944248872/1472312239791931402/af_logo.png"
     )
 
     embed.set_image(
-        url="https://cdn.discordapp.com/attachments/1430717412944248872/1472312239791931402/af_logo.png"
+        url="https://cdn.discordapp.com/attachments/1430717412944248872/1472312218543456419/af_tickets.png"
     )
 
     embed.set_footer(text="Support Team | AF SERVICES")
