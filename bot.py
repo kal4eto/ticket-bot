@@ -1,19 +1,17 @@
 import os
 import re
 import io
-import time
 import asyncio
 from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-
 import asyncpg
 
-# =========================
-# ENV / CONFIG
-# =========================
+# ============================================================
+# CONFIG / ENV
+# ============================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -26,35 +24,43 @@ SUPPORT_CATEGORY_ID = int(os.getenv("SUPPORT_CATEGORY_ID", "0") or "0")
 
 TICKET_LOG_CHANNEL_ID = int(os.getenv("TICKET_LOG_CHANNEL_ID", "0") or "0")
 
-INACTIVITY_MINUTES = int(os.getenv("INACTIVITY_MINUTES", "60") or "60")
-
-AF_LOGO_URL = "https://cdn.discordapp.com/attachments/1430717412944248872/1472312239791931402/af_logo.png"
-AF_BANNER_URL = "https://cdn.discordapp.com/attachments/1430717412944248872/1472312218543456419/af_tickets.png"
+STATUS_ROTATE_SECONDS = int(os.getenv("STATUS_ROTATE_SECONDS", "15") or "15")
+DELETE_COUNTDOWN_SECONDS = int(os.getenv("DELETE_COUNTDOWN_SECONDS", "5") or "5")
 
 AF_BLUE = 0x1E90FF
+AF_LOGO_URL = os.getenv(
+    "AF_LOGO_URL",
+    "https://cdn.discordapp.com/attachments/1430717412944248872/1472312239791931402/af_logo.png"
+)
+AF_BANNER_URL = os.getenv(
+    "AF_BANNER_URL",
+    "https://cdn.discordapp.com/attachments/1430717412944248872/1472312218543456419/af_tickets.png"
+)
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL (Railway Postgres plugin should provide this).")
+    raise RuntimeError("Missing DATABASE_URL")
 if not GUILD_ID:
     raise RuntimeError("Missing GUILD_ID")
 
-# =========================
+
+# ============================================================
 # DISCORD BOT
-# =========================
+# ============================================================
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
-intents.message_content = False  # not needed
+intents.message_content = True  # needed to track first staff response time via on_message
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
 
-# =========================
-# DB SCHEMA
-# =========================
+
+# ============================================================
+# DATABASE SCHEMA
+# ============================================================
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ticket_counters (
   kind TEXT PRIMARY KEY,
@@ -65,106 +71,59 @@ CREATE TABLE IF NOT EXISTS tickets (
   channel_id BIGINT PRIMARY KEY,
   guild_id BIGINT NOT NULL,
   owner_id BIGINT NOT NULL,
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL,                 -- claim/custom/support
   ticket_num INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'open', -- open/closed/deleted
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_activity TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   claimed_by BIGINT NULL,
-  priority TEXT NULL, -- low/medium/high
+  priority TEXT NULL,                 -- low/medium/high
   first_staff_response_seconds INTEGER NULL,
-  control_message_id BIGINT NULL
+  control_message_id BIGINT NULL,
+
+  -- to reduce rate-limit edits for animated status
+  last_footer_text TEXT NULL,
+  last_topic_text TEXT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tickets_open_owner_kind
+CREATE INDEX IF NOT EXISTS idx_open_owner_kind
 ON tickets (guild_id, owner_id, kind)
-WHERE status = 'open';
+WHERE status='open';
 
-CREATE INDEX IF NOT EXISTS idx_tickets_status_activity
-ON tickets (status, last_activity);
+CREATE INDEX IF NOT EXISTS idx_status
+ON tickets (status);
 """
 
-# =========================
-# HELPERS
-# =========================
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
-def safe_name(s: str) -> str:
-    s = s.lower().strip()
-    s = re.sub(r"[^a-z0-9\-]", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:20] if s else "user"
-
-def kind_label(kind: str) -> str:
-    return {"claim": "Claim Order", "custom": "Custom Order", "support": "Support"}.get(kind, "Support")
-
-def kind_to_category_id(kind: str) -> int:
-    if kind == "claim":
-        return CLAIM_CATEGORY_ID
-    if kind == "custom":
-        return CUSTOM_CATEGORY_ID
-    return SUPPORT_CATEGORY_ID
-
-def kind_prefix(kind: str) -> str:
-    # You wanted support- for custom/support, claim- for claim
-    return "claim" if kind == "claim" else "support"
-
-def priority_color(priority: str | None) -> int:
-    if priority == "low":
-        return 0x2ECC71
-    if priority == "medium":
-        return 0xF1C40F
-    if priority == "high":
-        return 0xE74C3C
-    return AF_BLUE
-
-def priority_emoji(priority: str | None) -> str:
-    if priority == "high":
-        return "🔴"
-    if priority == "medium":
-        return "🟡"
-    if priority == "low":
-        return "🟢"
-    return "🔵"
-
-def build_channel_name(kind: str, user: discord.abc.User, num: int, priority: str | None) -> str:
-    # example: 🔴-support-user-0004
-    base = f"{kind_prefix(kind)}-{safe_name(user.name)}-{num:04d}"
-    return f"{priority_emoji(priority)}-{base}"
-
-def get_staff_role(guild: discord.Guild) -> discord.Role | None:
-    return guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
-
-def member_is_staff(member: discord.Member) -> bool:
-    sr = get_staff_role(member.guild)
-    return (sr in member.roles) if sr else False
-
-async def ensure_db():
+async def ensure_db() -> None:
     global db_pool
     if db_pool is None:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with db_pool.acquire() as con:
             await con.execute(SCHEMA_SQL)
 
+
 async def db_fetchrow(q: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.fetchrow(q, *args)
+
 
 async def db_fetch(q: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.fetch(q, *args)
 
+
 async def db_execute(q: str, *args):
     assert db_pool is not None
     async with db_pool.acquire() as con:
         return await con.execute(q, *args)
 
+
 async def get_next_ticket_num(kind: str) -> int:
     """
-    Atomically increments counter for kind and returns the new number.
+    Atomically increments counter for this ticket kind.
     """
     assert db_pool is not None
     async with db_pool.acquire() as con:
@@ -176,9 +135,70 @@ async def get_next_ticket_num(kind: str) -> int:
             SET next_num = ticket_counters.next_num + 1
             RETURNING next_num;
             """,
-            kind,
+            kind
         )
         return int(row["next_num"])
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def safe_name(name: str) -> str:
+    name = name.lower().strip()
+    name = re.sub(r"[^a-z0-9]", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:18] if name else "user"
+
+
+def kind_label(kind: str) -> str:
+    return {"claim": "Claim Order", "custom": "Custom Order", "support": "Issues/Help"}.get(kind, "Support")
+
+
+def kind_prefix(kind: str) -> str:
+    # you asked for support-user-0004 format; we keep per type too:
+    return {"claim": "claim", "custom": "custom", "support": "support"}.get(kind, "support")
+
+
+def priority_color(priority: str | None) -> int:
+    if priority == "low":
+        return 0x2ECC71
+    if priority == "medium":
+        return 0xF1C40F
+    if priority == "high":
+        return 0xE74C3C
+    return AF_BLUE
+
+
+def priority_emoji(priority: str | None) -> str:
+    if priority == "high":
+        return "🔴"
+    if priority == "medium":
+        return "🟡"
+    if priority == "low":
+        return "🟢"
+    return "🔵"
+
+
+def category_for_kind(kind: str) -> int:
+    if kind == "claim":
+        return CLAIM_CATEGORY_ID
+    if kind == "custom":
+        return CUSTOM_CATEGORY_ID
+    return SUPPORT_CATEGORY_ID
+
+
+def get_staff_role(guild: discord.Guild) -> discord.Role | None:
+    return guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
+
+
+def is_staff(member: discord.Member) -> bool:
+    role = get_staff_role(member.guild)
+    return (role in member.roles) if role else False
+
 
 async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
     if not TICKET_LOG_CHANNEL_ID:
@@ -192,34 +212,123 @@ async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
     except Exception:
         return None
 
-async def build_transcript(channel: discord.TextChannel) -> bytes:
-    lines = []
+
+def make_channel_name(kind: str, owner: discord.abc.User, num: int, priority: str | None) -> str:
+    # Example: 🔴-support-username-0004
+    return f"{priority_emoji(priority)}-{kind_prefix(kind)}-{safe_name(owner.name)}-{num:04d}"
+
+
+# ============================================================
+# EMBEDS
+# ============================================================
+def panel_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="AF SERVICES Tickets",
+        description=(
+            "Do you require assistance with anything? If so,\n"
+            "please open a ticket and our support team will answer your queries.\n\n"
+            "**What can we help with?**\n"
+            "• Claim Order\n"
+            "• Custom Order\n"
+            "• Issues/Help\n\n"
+            "Please be precise and straight forward with your query."
+        ),
+        color=AF_BLUE,
+    )
+    # keep stable links (no expiring query params)
+    e.set_author(name="AF SERVICES Support System", icon_url=AF_LOGO_URL)
+    e.set_thumbnail(url=AF_LOGO_URL)
+    e.set_image(url=AF_BANNER_URL)
+    e.set_footer(text="Support Team | AF SERVICES")
+    return e
+
+
+def ticket_embed(
+    kind: str,
+    owner_mention: str,
+    claimed_by_mention: str | None,
+    priority: str | None,
+    first_staff_seconds: int | None,
+    footer_text: str | None
+) -> discord.Embed:
+    title = kind_label(kind)
+    claimed_line = claimed_by_mention or "This ticket has not been claimed!"
+    pr_text = (priority or "not set").upper()
+
+    e = discord.Embed(
+        title=f"{title} ({title})",
+        description=(
+            "Thank you for contacting us.\n"
+            "Please describe your request clearly.\n\n"
+            "**Claimed by**\n"
+            f"{claimed_line}\n\n"
+            f"**Priority:** {pr_text}\n"
+            f"**Owner:** {owner_mention}"
+        ),
+        color=priority_color(priority),
+    )
+    if first_staff_seconds is not None:
+        mins = first_staff_seconds // 60
+        secs = first_staff_seconds % 60
+        e.add_field(name="First staff response", value=f"{mins}m {secs}s", inline=False)
+
+    e.set_author(name="AF SERVICES Tickets", icon_url=AF_LOGO_URL)
+    e.set_thumbnail(url=AF_LOGO_URL)
+    # keep banner off ticket embeds to reduce clutter; you can enable if you want
+    if footer_text:
+        e.set_footer(text=footer_text)
+    else:
+        e.set_footer(text="AF SERVICES")
+    return e
+
+
+# ============================================================
+# TRANSCRIPT (FORMATTED TXT)
+# ============================================================
+async def build_formatted_transcript(channel: discord.TextChannel) -> bytes:
+    lines: list[str] = []
+    lines.append(f"Transcript for: {channel.name}")
+    lines.append(f"Channel ID: {channel.id}")
+    lines.append(f"Generated: {utcnow().isoformat()}")
+    lines.append("=" * 80)
+
     async for msg in channel.history(limit=None, oldest_first=True):
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        ts = msg.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         author = f"{msg.author} ({msg.author.id})"
-        content = (msg.content or "").replace("\n", "\\n")
-        attach = ""
+        content = msg.content or ""
+        content = content.replace("\r", "")
+
+        lines.append(f"[{ts}] {author}")
+        if content.strip():
+            for line in content.split("\n"):
+                lines.append(f"  {line}")
+
         if msg.attachments:
-            attach = " | " + " ".join(a.url for a in msg.attachments)
-        lines.append(f"{ts} | {author} | {content}{attach}")
+            lines.append("  Attachments:")
+            for a in msg.attachments:
+                lines.append(f"    - {a.url}")
+
+        if msg.embeds:
+            lines.append(f"  Embeds: {len(msg.embeds)}")
+
+        lines.append("-" * 80)
+
+    lines.append("END OF TRANSCRIPT")
     return ("\n".join(lines)).encode("utf-8", errors="replace")
 
-async def send_transcript_to_log(
+
+async def send_transcript_txt(
     guild: discord.Guild,
     ticket_channel: discord.TextChannel,
     close_reason: str,
     closed_by: str
 ) -> bool:
-    """
-    Returns True if transcript successfully sent, else False.
-    """
     log_ch = await get_log_channel(guild)
     if not log_ch:
-        print("Transcript log channel not found. Check TICKET_LOG_CHANNEL_ID.")
         return False
 
     try:
-        data = await build_transcript(ticket_channel)
+        data = await build_formatted_transcript(ticket_channel)
         f = discord.File(io.BytesIO(data), filename=f"{ticket_channel.name}.txt")
         await log_ch.send(
             content=(
@@ -232,67 +341,15 @@ async def send_transcript_to_log(
         )
         return True
     except Exception as e:
-        print("Failed to send transcript:", e)
+        print("Transcript send failed:", e)
         return False
 
-# =========================
-# EMBEDS
-# =========================
-def ticket_embed(
-    kind: str,
-    owner_mention: str,
-    claimed_by_mention: str | None,
-    priority: str | None,
-    first_staff_seconds: int | None
-) -> discord.Embed:
-    title = kind_label(kind)
-    claimed_line = claimed_by_mention or "This ticket has not been claimed!"
-    pr_text = (priority or "not set").upper()
 
-    embed = discord.Embed(
-        title=f"{title} ({title})",
-        description=(
-            "Thank you for purchasing from us.\n"
-            "Feel free to add any additional info here.\n\n"
-            "**Claimed by**\n"
-            f"{claimed_line}\n\n"
-            f"**Priority:** {pr_text}\n"
-            f"**Owner:** {owner_mention}"
-        ),
-        color=priority_color(priority),
-    )
-    if first_staff_seconds is not None:
-        mins = first_staff_seconds // 60
-        secs = first_staff_seconds % 60
-        embed.add_field(name="First staff response", value=f"{mins}m {secs}s", inline=False)
+# ============================================================
+# PERSISTENT CUSTOM IDS (must be unique per ticket)
+# ============================================================
+PANEL_SELECT_CID = "af_panel_select"
 
-    embed.set_author(name="AF SERVICES Tickets", icon_url=AF_LOGO_URL)
-    embed.set_thumbnail(url=AF_LOGO_URL)
-    embed.set_footer(text="AF SERVICES")
-    return embed
-
-def panel_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="AF SERVICES Tickets",
-        description=(
-            "Do you require assistance with anything? If so,\n"
-            "please open a ticket and our support team will answer your queries.\n\n"
-            "**What can we help with?**\n"
-            "• Claim Order\n"
-            "• Custom Order\n"
-            "• Issues/Help\n\n"
-            "Please be precise and straight forward with your query."
-        ),
-        color=AF_BLUE
-    )
-    embed.set_author(name="AF SERVICES Support System", icon_url=AF_LOGO_URL)
-    embed.set_image(url=AF_BANNER_URL)
-    embed.set_footer(text="Support Team | AF SERVICES")
-    return embed
-
-# =========================
-# Persistent UI (custom_id + timeout=None)
-# =========================
 def cid_close(channel_id: int) -> str:
     return f"af_close:{channel_id}"
 
@@ -302,18 +359,17 @@ def cid_claim(channel_id: int) -> str:
 def cid_priority(channel_id: int) -> str:
     return f"af_priority:{channel_id}"
 
-def cid_reopen(channel_id: int) -> str:
-    return f"af_reopen:{channel_id}"
 
-PANEL_SELECT_CUSTOM_ID = "af_panel_select"
-
+# ============================================================
+# CLOSE MODAL
+# ============================================================
 class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(
-        label="Reason for closing",
+        label="Close reason",
         style=discord.TextStyle.long,
         required=True,
-        max_length=500,
-        placeholder="Example: Resolved / Delivered / Duplicate / No response..."
+        max_length=400,
+        placeholder="Example: Delivered / Resolved / Duplicate / etc."
     )
 
     def __init__(self, channel_id: int):
@@ -324,7 +380,7 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Invalid context.", ephemeral=True)
             return
-        if not member_is_staff(interaction.user):
+        if not is_staff(interaction.user):
             await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
             return
 
@@ -340,6 +396,10 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
             reason=str(self.reason.value)
         )
 
+
+# ============================================================
+# PRIORITY SELECT (staff only)
+# ============================================================
 class PrioritySelect(discord.ui.Select):
     def __init__(self, channel_id: int):
         self.channel_id = channel_id
@@ -353,20 +413,19 @@ class PrioritySelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            custom_id=cid_priority(channel_id)
+            custom_id=cid_priority(channel_id),
         )
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Invalid context.", ephemeral=True)
             return
-        if not member_is_staff(interaction.user):
+        if not is_staff(interaction.user):
             await interaction.response.send_message("Only staff can set priority.", ephemeral=True)
             return
 
         priority = self.values[0]
 
-        # Load ticket data
         row = await db_fetchrow(
             "SELECT owner_id, kind, ticket_num, status FROM tickets WHERE channel_id=$1",
             self.channel_id
@@ -380,11 +439,11 @@ class PrioritySelect(discord.ui.Select):
             priority, self.channel_id
         )
 
-        # Rename channel with emoji prefix
+        # rename channel (keep ORIGINAL creator!)
         ch = interaction.guild.get_channel(self.channel_id)
         if isinstance(ch, discord.TextChannel):
             owner = interaction.guild.get_member(int(row["owner_id"])) or interaction.user
-            new_name = build_channel_name(str(row["kind"]), owner, int(row["ticket_num"]), priority)
+            new_name = make_channel_name(str(row["kind"]), owner, int(row["ticket_num"]), priority)
             try:
                 await ch.edit(name=new_name)
             except Exception:
@@ -394,6 +453,10 @@ class PrioritySelect(discord.ui.Select):
 
         await interaction.response.send_message(f"✅ Priority set to **{priority.upper()}**.", ephemeral=True)
 
+
+# ============================================================
+# TICKET CONTROLS VIEW (persistent)
+# ============================================================
 class TicketControlView(discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=None)
@@ -405,7 +468,7 @@ class TicketControlView(discord.ui.View):
             label="Close Ticket",
             style=discord.ButtonStyle.danger,
             emoji="🔒",
-            custom_id=cid_close(channel_id)
+            custom_id=cid_close(channel_id),
         )
         close_btn.callback = self._close_callback
         self.add_item(close_btn)
@@ -414,7 +477,7 @@ class TicketControlView(discord.ui.View):
             label="Claim",
             style=discord.ButtonStyle.success,
             emoji="✋",
-            custom_id=cid_claim(channel_id)
+            custom_id=cid_claim(channel_id),
         )
         claim_btn.callback = self._claim_callback
         self.add_item(claim_btn)
@@ -426,12 +489,12 @@ class TicketControlView(discord.ui.View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Invalid context.", ephemeral=True)
             return
-        if not member_is_staff(interaction.user):
+        if not is_staff(interaction.user):
             await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
             return
 
         row = await db_fetchrow(
-            "SELECT claimed_by, status FROM tickets WHERE channel_id=$1",
+            "SELECT owner_id, kind, ticket_num, claimed_by, priority, status FROM tickets WHERE channel_id=$1",
             self.channel_id
         )
         if not row or row["status"] != "open":
@@ -446,82 +509,36 @@ class TicketControlView(discord.ui.View):
             interaction.user.id, self.channel_id
         )
 
+        # keep channel name based on ORIGINAL creator
+        owner = interaction.guild.get_member(int(row["owner_id"]))
         ch = interaction.guild.get_channel(self.channel_id)
-        if isinstance(ch, discord.TextChannel):
+        if owner and isinstance(ch, discord.TextChannel):
+            new_name = make_channel_name(str(row["kind"]), owner, int(row["ticket_num"]), row["priority"])
+            try:
+                await ch.edit(name=new_name)
+            except Exception:
+                pass
             await refresh_ticket_control_message(ch)
 
         await interaction.response.send_message("✅ Ticket claimed.", ephemeral=True)
 
-class ReopenView(discord.ui.View):
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=None)
-        self.channel_id = channel_id
 
-        reopen_btn = discord.ui.Button(
-            label="Reopen",
-            style=discord.ButtonStyle.success,
-            emoji="🔓",
-            custom_id=cid_reopen(channel_id)
-        )
-        reopen_btn.callback = self._reopen_callback
-        self.add_item(reopen_btn)
-
-    async def _reopen_callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Invalid context.", ephemeral=True)
-            return
-        if not member_is_staff(interaction.user):
-            await interaction.response.send_message("Only staff can reopen tickets.", ephemeral=True)
-            return
-
-        row = await db_fetchrow(
-            "SELECT owner_id, status FROM tickets WHERE channel_id=$1",
-            self.channel_id
-        )
-        if not row:
-            await interaction.response.send_message("Ticket not found.", ephemeral=True)
-            return
-
-        # Reopen in DB
-        await db_execute(
-            "UPDATE tickets SET status='open', last_activity=NOW() WHERE channel_id=$1",
-            self.channel_id
-        )
-
-        ch = interaction.guild.get_channel(self.channel_id)
-        if isinstance(ch, discord.TextChannel):
-            guild = interaction.guild
-            sr = get_staff_role(guild)
-            owner = guild.get_member(int(row["owner_id"]))
-
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            }
-            if owner:
-                overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-            if sr:
-                overwrites[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-            await ch.edit(overwrites=overwrites)
-
-            await ch.send("🔓 Ticket reopened.", view=TicketControlView(self.channel_id))
-            await refresh_ticket_control_message(ch)
-
-        await interaction.response.send_message("✅ Reopened.", ephemeral=True)
-
+# ============================================================
+# PANEL SELECT VIEW (persistent)
+# ============================================================
 class TicketPanelSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Claim Order", value="claim", description="Click here to Claim Your Order", emoji="📦"),
-            discord.SelectOption(label="Custom Order", value="custom", description="Click here to get a Custom Order", emoji="🛒"),
-            discord.SelectOption(label="Issues/Help", value="support", description="Click here for Issues/Help", emoji="🛠️"),
+            discord.SelectOption(label="Claim Order", value="claim", description="Claim your order", emoji="📦"),
+            discord.SelectOption(label="Custom Order", value="custom", description="Request a custom order", emoji="🛒"),
+            discord.SelectOption(label="Issues/Help", value="support", description="Get help", emoji="🛠️"),
         ]
         super().__init__(
             placeholder="Select a category...",
             min_values=1,
             max_values=1,
             options=options,
-            custom_id=PANEL_SELECT_CUSTOM_ID
+            custom_id=PANEL_SELECT_CID,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -546,22 +563,24 @@ class TicketPanelSelect(discord.ui.Select):
                 await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
             return
 
-        cat_id = kind_to_category_id(kind)
+        # Create channel
+        cat_id = category_for_kind(kind)
         category = guild.get_channel(cat_id)
         if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message("Ticket category is not configured correctly.", ephemeral=True)
+            await interaction.response.send_message("Ticket category not configured correctly.", ephemeral=True)
             return
 
         num = await get_next_ticket_num(kind)
-        channel_name = build_channel_name(kind, user, num, priority=None)
+        priority = None  # not set initially
+        channel_name = make_channel_name(kind, user, num, priority)
 
-        sr = get_staff_role(guild)
+        staff_role = get_staff_role(guild)
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
-        if sr:
-            overwrites[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         channel = await guild.create_text_channel(
             name=channel_name,
@@ -570,17 +589,24 @@ class TicketPanelSelect(discord.ui.Select):
             reason="Ticket created"
         )
 
-        # Insert ticket into DB
+        # Insert DB row
         await db_execute(
             """
             INSERT INTO tickets(channel_id, guild_id, owner_id, kind, ticket_num, status)
-            VALUES ($1, $2, $3, $4, $5, 'open')
+            VALUES ($1,$2,$3,$4,$5,'open')
             """,
             channel.id, guild.id, user.id, kind, num
         )
 
-        # Send control message with embed + controls
-        embed = ticket_embed(kind, user.mention, None, None, None)
+        # Send control message
+        embed = ticket_embed(
+            kind=kind,
+            owner_mention=user.mention,
+            claimed_by_mention=None,
+            priority=None,
+            first_staff_seconds=None,
+            footer_text="AF SERVICES • Status: Waiting for staff"
+        )
         msg = await channel.send(content=user.mention, embed=embed, view=TicketControlView(channel.id))
 
         await db_execute(
@@ -588,38 +614,115 @@ class TicketPanelSelect(discord.ui.Select):
             msg.id, channel.id
         )
 
-        # Attach the view persistently to this message id (survives restarts)
+        # Register view persistently to this message
         bot.add_view(TicketControlView(channel.id), message_id=msg.id)
 
         await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
 
 class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(TicketPanelSelect())
 
-# =========================
-# COMMAND CHECKS / PANEL COMMAND
-# =========================
-def staff_check():
+
+# ============================================================
+# STAFF CHECK + COMMANDS
+# ============================================================
+def staff_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return False
-        return member_is_staff(interaction.user)
+        return is_staff(interaction.user)
     return app_commands.check(predicate)
 
-@bot.tree.command(name="ticket_panel", description="Send the AF SERVICES ticket panel.")
-@staff_check()
+
+@bot.tree.command(name="ticket_panel", description="Post the AF SERVICES ticket panel.")
+@staff_only()
 async def ticket_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=panel_embed(), view=TicketPanelView())
 
-# =========================
-# TICKET CONTROL MESSAGE REFRESH
-# =========================
+
+@bot.tree.command(name="ticket_stats", description="Show ticket stats overview (server).")
+@staff_only()
+async def ticket_stats(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Use in a server.", ephemeral=True)
+        return
+
+    # totals
+    totals = await db_fetchrow(
+        """
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
+          SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) AS closed,
+          SUM(CASE WHEN status='deleted' THEN 1 ELSE 0 END) AS deleted
+        FROM tickets
+        WHERE guild_id=$1
+        """,
+        guild.id
+    )
+
+    by_kind = await db_fetch(
+        """
+        SELECT kind,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open
+        FROM tickets
+        WHERE guild_id=$1
+        GROUP BY kind
+        ORDER BY kind
+        """,
+        guild.id
+    )
+
+    avg_resp = await db_fetchrow(
+        """
+        SELECT
+          AVG(first_staff_response_seconds)::float AS avg_first_response
+        FROM tickets
+        WHERE guild_id=$1 AND first_staff_response_seconds IS NOT NULL
+        """,
+        guild.id
+    )
+
+    avg_seconds = avg_resp["avg_first_response"]
+    if avg_seconds is None:
+        avg_text = "N/A"
+    else:
+        avg_seconds = int(avg_seconds)
+        avg_text = f"{avg_seconds // 60}m {avg_seconds % 60}s"
+
+    e = discord.Embed(
+        title="AF SERVICES • Ticket Stats",
+        color=AF_BLUE
+    )
+    e.set_thumbnail(url=AF_LOGO_URL)
+
+    e.add_field(name="Total tickets", value=str(totals["total"]), inline=True)
+    e.add_field(name="Open", value=str(totals["open"] or 0), inline=True)
+    e.add_field(name="Closed", value=str(totals["closed"] or 0), inline=True)
+    e.add_field(name="Deleted", value=str(totals["deleted"] or 0), inline=True)
+    e.add_field(name="Avg first staff response", value=avg_text, inline=False)
+
+    lines = []
+    for r in by_kind:
+        lines.append(f"**{kind_label(r['kind'])}** — total {r['total']}, open {r['open'] or 0}")
+    e.add_field(name="By category", value="\n".join(lines) if lines else "No data", inline=False)
+
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+# ============================================================
+# REFRESH CONTROL MESSAGE
+# ============================================================
 async def refresh_ticket_control_message(channel: discord.TextChannel):
     row = await db_fetchrow(
         """
-        SELECT owner_id, kind, status, claimed_by, priority, first_staff_response_seconds, control_message_id
+        SELECT owner_id, kind, status, claimed_by, priority,
+               first_staff_response_seconds, control_message_id, last_footer_text
         FROM tickets WHERE channel_id=$1
         """,
         channel.id
@@ -630,18 +733,19 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
     owner = channel.guild.get_member(int(row["owner_id"]))
     owner_mention = owner.mention if owner else f"<@{int(row['owner_id'])}>"
 
-    claimed_by_id = row["claimed_by"]
     claimed_by_mention = None
-    if claimed_by_id:
-        m = channel.guild.get_member(int(claimed_by_id))
-        claimed_by_mention = m.mention if m else f"<@{int(claimed_by_id)}>"
+    if row["claimed_by"]:
+        claimer = channel.guild.get_member(int(row["claimed_by"]))
+        claimed_by_mention = claimer.mention if claimer else f"<@{int(row['claimed_by'])}>"
 
+    footer_text = row["last_footer_text"] or "AF SERVICES"
     embed = ticket_embed(
-        str(row["kind"]),
-        owner_mention,
-        claimed_by_mention,
-        row["priority"],
-        row["first_staff_response_seconds"]
+        kind=str(row["kind"]),
+        owner_mention=owner_mention,
+        claimed_by_mention=claimed_by_mention,
+        priority=row["priority"],
+        first_staff_seconds=row["first_staff_response_seconds"],
+        footer_text=footer_text
     )
 
     mid = row["control_message_id"]
@@ -652,84 +756,72 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
         msg = await channel.fetch_message(int(mid))
         if str(row["status"]) == "open":
             await msg.edit(embed=embed, view=TicketControlView(channel.id))
+            bot.add_view(TicketControlView(channel.id), message_id=msg.id)
         else:
             await msg.edit(embed=embed, view=None)
     except Exception:
         pass
 
-# =========================
-# CLOSE FLOW (transcript -> deleting in 5 -> delete)
-# =========================
+
+# ============================================================
+# CLOSE FLOW: transcript -> countdown -> delete
+# ============================================================
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
-    # Update DB
+    # mark closed
     await db_execute(
         "UPDATE tickets SET status='closed', last_activity=NOW() WHERE channel_id=$1",
         channel.id
     )
 
-    # Lock channel (owner cannot talk)
-    row = await db_fetchrow("SELECT owner_id FROM tickets WHERE channel_id=$1", channel.id)
-    if row:
-        guild = channel.guild
-        sr = get_staff_role(guild)
-        owner = guild.get_member(int(row["owner_id"]))
+    # transcript first
+    transcript_sent = await send_transcript_txt(
+        guild=channel.guild,
+        ticket_channel=channel,
+        close_reason=reason,
+        closed_by=closed_by
+    )
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        }
-        if sr:
-            overwrites[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        if owner:
-            overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
-        try:
-            await channel.edit(overwrites=overwrites)
-        except Exception:
-            pass
-
-    # Send transcript
-    sent = await send_transcript_to_log(channel.guild, channel, reason, closed_by)
-
-    # Countdown message (always)
+    # message in channel
     base = (
         f"🔒 **Ticket Closed**\n"
         f"Closed by: {closed_by}\n"
-        f"Reason: {reason}\n\n"
-        f"{'✅ Transcript saved.' if sent else '⚠️ Transcript failed (check log channel permissions).'}\n"
-        f"🗑️ Deleting in 5 seconds..."
+        f"Reason: {reason}\n"
+        f"{'✅ Transcript saved.' if transcript_sent else '⚠️ Transcript failed (check log channel + permissions).'}\n\n"
+        f"🗑️ Deleting in {DELETE_COUNTDOWN_SECONDS} seconds…"
     )
-    countdown_msg = await channel.send(base, view=ReopenView(channel.id))
-    # Attach reopen view persistently to that message
-    bot.add_view(ReopenView(channel.id), message_id=countdown_msg.id)
+    countdown_msg = await channel.send(base)
 
-    # Countdown edits
-    for i in range(4, 0, -1):
+    # countdown edits
+    for i in range(DELETE_COUNTDOWN_SECONDS - 1, 0, -1):
         await asyncio.sleep(1)
         try:
-            await countdown_msg.edit(content=base.replace("Deleting in 5 seconds...", f"Deleting in {i} seconds..."))
+            await countdown_msg.edit(content=base.replace(
+                f"Deleting in {DELETE_COUNTDOWN_SECONDS} seconds…",
+                f"Deleting in {i} seconds…"
+            ))
         except Exception:
             pass
 
     await asyncio.sleep(1)
 
-    # Delete channel and mark in DB
+    # delete channel
+    await db_execute("UPDATE tickets SET status='deleted' WHERE channel_id=$1", channel.id)
     try:
-        await db_execute("UPDATE tickets SET status='deleted' WHERE channel_id=$1", channel.id)
         await channel.delete(reason="Ticket closed (auto delete after transcript).")
     except Exception as e:
-        print("Failed to delete channel:", e)
+        print("Channel delete failed:", e)
 
-# =========================
-# STAFF RESPONSE TIME TRACKING + LAST ACTIVITY
-# =========================
+
+# ============================================================
+# FIRST STAFF RESPONSE TIME (DB ONLY) + activity update
+# ============================================================
 @bot.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot:
         return
-
     if not isinstance(message.channel, discord.TextChannel):
         return
 
-    # Is this a ticket channel?
     row = await db_fetchrow(
         "SELECT created_at, first_staff_response_seconds, status FROM tickets WHERE channel_id=$1",
         message.channel.id
@@ -737,114 +829,125 @@ async def on_message(message: discord.Message):
     if not row:
         return
 
-    # Update last activity for any message
-    await db_execute(
-        "UPDATE tickets SET last_activity=NOW() WHERE channel_id=$1",
-        message.channel.id
-    )
+    # update last activity always (even though we removed inactivity close, this is still useful for stats later)
+    await db_execute("UPDATE tickets SET last_activity=NOW() WHERE channel_id=$1", message.channel.id)
 
-    # First staff response time
-    if isinstance(message.author, discord.Member) and row["status"] == "open":
-        if member_is_staff(message.author) and row["first_staff_response_seconds"] is None:
+    # first staff response stored ONLY in DB (no messages sent)
+    if row["status"] == "open" and isinstance(message.author, discord.Member) and is_staff(message.author):
+        if row["first_staff_response_seconds"] is None:
             created_at: datetime = row["created_at"]
             seconds = int((utcnow() - created_at).total_seconds())
             await db_execute(
                 "UPDATE tickets SET first_staff_response_seconds=$1 WHERE channel_id=$2",
                 seconds, message.channel.id
             )
-
-            # Log it
-            log_ch = await get_log_channel(message.guild)
-            if log_ch:
-                mins = seconds // 60
-                secs = seconds % 60
-                await log_ch.send(
-                    f"⏱️ **First staff response**\n"
-                    f"Ticket: {message.channel.mention}\n"
-                    f"Staff: {message.author.mention}\n"
-                    f"Time: **{mins}m {secs}s**"
-                )
-
-            # Refresh embed
+            # update embed field
             await refresh_ticket_control_message(message.channel)
 
     await bot.process_commands(message)
 
-# =========================
-# INACTIVITY AUTO-CLOSE
-# =========================
-@tasks.loop(seconds=30)
-async def inactivity_watcher():
-    # Close tickets that are open and inactive
-    rows = await db_fetch(
-        """
-        SELECT channel_id
-        FROM tickets
-        WHERE status='open'
-          AND last_activity < (NOW() - ($1::int * INTERVAL '1 minute'))
-        """,
-        INACTIVITY_MINUTES
-    )
 
+# ============================================================
+# ANIMATED STATUS (Method C: footer + topic)
+# ============================================================
+def compute_status_strings(kind: str, claimed_by: int | None, priority: str | None, tick: int) -> tuple[str, str]:
+    """
+    Returns (footer_text, topic_text).
+    Rotate among a few phrases. Also reflect claimed/priority.
+    """
+    base_states = [
+        "Waiting for staff",
+        "Processing",
+        "AF SERVICES Support",
+        "Please provide details",
+    ]
+    state = base_states[tick % len(base_states)]
+
+    pr = (priority or "not set").upper()
+    claimed = "Claimed" if claimed_by else "Unclaimed"
+
+    footer = f"AF SERVICES • Status: {state} • {claimed} • Priority: {pr}"
+    topic = f"AF SERVICES Ticket | {claimed} | Priority: {pr} | {state}"
+    return footer, topic
+
+
+@tasks.loop(seconds=STATUS_ROTATE_SECONDS)
+async def status_rotator():
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return
 
-    for r in rows:
-        cid = int(r["channel_id"])
-        ch = guild.get_channel(cid)
-        if isinstance(ch, discord.TextChannel):
-            # System close
-            await close_ticket_flow(
-                channel=ch,
-                closed_by="System (inactivity)",
-                reason=f"Inactivity timeout ({INACTIVITY_MINUTES} minutes)."
-            )
+    rows = await db_fetch(
+        """
+        SELECT channel_id, kind, claimed_by, priority, control_message_id, last_footer_text, last_topic_text
+        FROM tickets
+        WHERE guild_id=$1 AND status='open'
+        """,
+        guild.id
+    )
 
-# =========================
-# READY: init DB, sync commands, attach persistent views
-# =========================
+    tick = int(utcnow().timestamp() // STATUS_ROTATE_SECONDS)
+
+    for r in rows:
+        channel_id = int(r["channel_id"])
+        ch = guild.get_channel(channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            continue
+
+        footer_text, topic_text = compute_status_strings(
+            kind=str(r["kind"]),
+            claimed_by=r["claimed_by"],
+            priority=r["priority"],
+            tick=tick
+        )
+
+        # Update channel topic only if changed (rate-limit friendly)
+        if (r["last_topic_text"] or "") != topic_text:
+            try:
+                await ch.edit(topic=topic_text)
+                await db_execute("UPDATE tickets SET last_topic_text=$1 WHERE channel_id=$2", topic_text, channel_id)
+            except Exception:
+                pass
+
+        # Update embed footer only if changed
+        if (r["last_footer_text"] or "") != footer_text:
+            await db_execute("UPDATE tickets SET last_footer_text=$1 WHERE channel_id=$2", footer_text, channel_id)
+            await refresh_ticket_control_message(ch)
+
+
+# ============================================================
+# READY: init DB, sync commands, register persistent views
+# ============================================================
 @bot.event
 async def on_ready():
     await ensure_db()
 
-    # Fast guild sync
+    # Sync slash commands to your guild (fast)
     try:
-        guild_obj = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
-        await bot.tree.sync(guild=guild_obj)
+        gobj = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=gobj)
+        await bot.tree.sync(guild=gobj)
     except Exception as e:
         print("Command sync error:", e)
 
-    # Persistent panel view (select menu)
+    # persistent panel view
     bot.add_view(TicketPanelView())
 
-    # Re-attach views to existing open/closed tickets (survive restarts)
+    # re-attach controls to existing open tickets
     rows = await db_fetch(
-        "SELECT channel_id, control_message_id, status FROM tickets WHERE guild_id=$1 AND status IN ('open','closed')",
+        "SELECT channel_id, control_message_id FROM tickets WHERE guild_id=$1 AND status='open' AND control_message_id IS NOT NULL",
         GUILD_ID
     )
     for r in rows:
-        cid = int(r["channel_id"])
-        mid = r["control_message_id"]
-        status = str(r["status"])
+        try:
+            bot.add_view(TicketControlView(int(r["channel_id"])), message_id=int(r["control_message_id"]))
+        except Exception:
+            pass
 
-        if mid:
-            try:
-                if status == "open":
-                    bot.add_view(TicketControlView(cid), message_id=int(mid))
-                else:
-                    # closed tickets: you might have a reopen message, but we attach reopen view when closing
-                    pass
-            except Exception:
-                pass
+    if not status_rotator.is_running():
+        status_rotator.start()
 
-    if not inactivity_watcher.is_running():
-        inactivity_watcher.start()
+    print(f"✅ Ticket bot online as {bot.user}")
 
-    print(f"✅ Ticket Bot Online as {bot.user}")
 
-# =========================
-# RUN
-# =========================
 bot.run(DISCORD_TOKEN)
