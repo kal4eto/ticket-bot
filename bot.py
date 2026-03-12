@@ -51,7 +51,8 @@ if not GUILD_ID:
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
-intents.message_content = True  # needed to track first staff response time via on_message
+intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -71,17 +72,14 @@ CREATE TABLE IF NOT EXISTS tickets (
   channel_id BIGINT PRIMARY KEY,
   guild_id BIGINT NOT NULL,
   owner_id BIGINT NOT NULL,
-  kind TEXT NOT NULL,                 -- claim/custom/support
+  kind TEXT NOT NULL,
   ticket_num INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open', -- open/closed/deleted
+  status TEXT NOT NULL DEFAULT 'open',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_activity TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   claimed_by BIGINT NULL,
-  priority TEXT NULL,                 -- low/medium/high
   first_staff_response_seconds INTEGER NULL,
   control_message_id BIGINT NULL,
-
-  -- to reduce rate-limit edits for animated status
   last_footer_text TEXT NULL,
   last_topic_text TEXT NULL
 );
@@ -92,6 +90,12 @@ WHERE status='open';
 
 CREATE INDEX IF NOT EXISTS idx_status
 ON tickets (status);
+
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_by BIGINT NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS first_staff_response_seconds INTEGER NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS control_message_id BIGINT NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_footer_text TEXT NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_topic_text TEXT NULL;
 """
 
 
@@ -101,6 +105,7 @@ async def ensure_db() -> None:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with db_pool.acquire() as con:
             await con.execute(SCHEMA_SQL)
+            await con.execute("ALTER TABLE tickets DROP COLUMN IF EXISTS priority")
 
 
 async def db_fetchrow(q: str, *args):
@@ -122,9 +127,6 @@ async def db_execute(q: str, *args):
 
 
 async def get_next_ticket_num(kind: str) -> int:
-    """
-    Atomically increments counter for this ticket kind.
-    """
     assert db_pool is not None
     async with db_pool.acquire() as con:
         row = await con.fetchrow(
@@ -149,38 +151,33 @@ def utcnow() -> datetime:
 
 def safe_name(name: str) -> str:
     name = name.lower().strip()
-    name = re.sub(r"[^a-z0-9]", "-", name)
+    name = re.sub(r"[^a-z0-9-]", "-", name)
     name = re.sub(r"-{2,}", "-", name).strip("-")
-    return name[:18] if name else "user"
+    return name[:40] if name else "ticket"
 
 
 def kind_label(kind: str) -> str:
-    return {"claim": "Claim Order", "custom": "Custom Order", "support": "Issues/Help"}.get(kind, "Support")
+    return {
+        "claim": "Claim Order",
+        "custom": "Custom Order",
+        "support": "Issues/Help",
+    }.get(kind, "Support")
 
 
 def kind_prefix(kind: str) -> str:
-    # you asked for support-user-0004 format; we keep per type too:
-    return {"claim": "claim", "custom": "custom", "support": "support"}.get(kind, "support")
+    return {
+        "claim": "claim",
+        "custom": "custom",
+        "support": "support",
+    }.get(kind, "support")
 
 
-def priority_color(priority: str | None) -> int:
-    if priority == "low":
-        return 0x2ECC71
-    if priority == "medium":
-        return 0xF1C40F
-    if priority == "high":
-        return 0xE74C3C
-    return AF_BLUE
-
-
-def priority_emoji(priority: str | None) -> str:
-    if priority == "high":
-        return "🔴"
-    if priority == "medium":
-        return "🟡"
-    if priority == "low":
-        return "🟢"
-    return "🔵"
+def kind_emoji(kind: str) -> str:
+    return {
+        "claim": "🛒",
+        "custom": "🧾",
+        "support": "🎫",
+    }.get(kind, "🎫")
 
 
 def category_for_kind(kind: str) -> int:
@@ -213,9 +210,32 @@ async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
         return None
 
 
-def make_channel_name(kind: str, owner: discord.abc.User, num: int, priority: str | None) -> str:
-    # Example: 🔴-support-username-0004
-    return f"{priority_emoji(priority)}-{kind_prefix(kind)}-{safe_name(owner.name)}-{num:04d}"
+def make_channel_name(kind: str, owner: discord.abc.User, num: int) -> str:
+    return f"{kind_emoji(kind)}-{kind_prefix(kind)}-{safe_name(owner.name)}-{num:04d}"
+
+
+def sanitize_channel_rename(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^\w\-\u0080-\uffff]", "", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text[:90] if text else "renamed-ticket"
+
+
+async def is_ticket_channel(channel_id: int) -> bool:
+    row = await db_fetchrow("SELECT 1 FROM tickets WHERE channel_id=$1", channel_id)
+    return row is not None
+
+
+async def hide_ticket_from_other_staff(channel: discord.TextChannel, claimer: discord.Member) -> None:
+    staff_role = get_staff_role(channel.guild)
+    if staff_role:
+        await channel.set_permissions(staff_role, overwrite=discord.PermissionOverwrite(view_channel=False))
+
+    await channel.set_permissions(
+        claimer,
+        overwrite=discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    )
 
 
 # ============================================================
@@ -235,7 +255,6 @@ def panel_embed() -> discord.Embed:
         ),
         color=AF_BLUE,
     )
-    # keep stable links (no expiring query params)
     e.set_author(name="AF SERVICES Support System", icon_url=AF_LOGO_URL)
     e.set_thumbnail(url=AF_LOGO_URL)
     e.set_image(url=AF_BANNER_URL)
@@ -247,25 +266,22 @@ def ticket_embed(
     kind: str,
     owner_mention: str,
     claimed_by_mention: str | None,
-    priority: str | None,
     first_staff_seconds: int | None,
     footer_text: str | None
 ) -> discord.Embed:
     title = kind_label(kind)
-    claimed_line = claimed_by_mention or "This ticket has not been claimed!"
-    pr_text = (priority or "not set").upper()
+    claimed_line = claimed_by_mention or "This ticket has not been claimed."
 
     e = discord.Embed(
-        title=f"{title} ({title})",
+        title=title,
         description=(
             "Thank you for contacting us.\n"
             "Please describe your request clearly.\n\n"
             "**Claimed by**\n"
             f"{claimed_line}\n\n"
-            f"**Priority:** {pr_text}\n"
             f"**Owner:** {owner_mention}"
         ),
-        color=priority_color(priority),
+        color=AF_BLUE,
     )
     if first_staff_seconds is not None:
         mins = first_staff_seconds // 60
@@ -274,29 +290,45 @@ def ticket_embed(
 
     e.set_author(name="AF SERVICES Tickets", icon_url=AF_LOGO_URL)
     e.set_thumbnail(url=AF_LOGO_URL)
-    # keep banner off ticket embeds to reduce clutter; you can enable if you want
-    if footer_text:
-        e.set_footer(text=footer_text)
-    else:
-        e.set_footer(text="AF SERVICES")
+    e.set_footer(text=footer_text or "AF SERVICES")
     return e
 
 
 # ============================================================
-# TRANSCRIPT (FORMATTED TXT)
+# TRANSCRIPT
 # ============================================================
 async def build_formatted_transcript(channel: discord.TextChannel) -> bytes:
     lines: list[str] = []
+
+    ticket_row = await db_fetchrow(
+        "SELECT owner_id, kind, ticket_num, claimed_by, created_at FROM tickets WHERE channel_id=$1",
+        channel.id,
+    )
+
+    claimed_by_text = "Unclaimed"
+    if ticket_row and ticket_row["claimed_by"]:
+        claimed_member = channel.guild.get_member(int(ticket_row["claimed_by"]))
+        claimed_by_text = (
+            f"{claimed_member} ({claimed_member.id})"
+            if claimed_member else
+            f"{int(ticket_row['claimed_by'])}"
+        )
+
     lines.append(f"Transcript for: {channel.name}")
     lines.append(f"Channel ID: {channel.id}")
+    if ticket_row:
+        lines.append(f"Ticket kind: {ticket_row['kind']}")
+        lines.append(f"Ticket number: {ticket_row['ticket_num']}")
+        lines.append(f"Ticket owner ID: {ticket_row['owner_id']}")
+        lines.append(f"Claimed by: {claimed_by_text}")
+        lines.append(f"Created at: {ticket_row['created_at'].isoformat()}")
     lines.append(f"Generated: {utcnow().isoformat()}")
     lines.append("=" * 80)
 
     async for msg in channel.history(limit=None, oldest_first=True):
         ts = msg.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         author = f"{msg.author} ({msg.author.id})"
-        content = msg.content or ""
-        content = content.replace("\r", "")
+        content = (msg.content or "").replace("\r", "")
 
         lines.append(f"[{ts}] {author}")
         if content.strip():
@@ -321,7 +353,8 @@ async def send_transcript_txt(
     guild: discord.Guild,
     ticket_channel: discord.TextChannel,
     close_reason: str,
-    closed_by: str
+    closed_by: str,
+    claimed_by: str,
 ) -> bool:
     log_ch = await get_log_channel(guild)
     if not log_ch:
@@ -335,6 +368,7 @@ async def send_transcript_txt(
                 f"🧾 **Ticket Transcript**\n"
                 f"Channel: `{ticket_channel.name}`\n"
                 f"Closed by: {closed_by}\n"
+                f"Claimed by: {claimed_by}\n"
                 f"Reason: {close_reason}"
             ),
             file=f
@@ -346,18 +380,17 @@ async def send_transcript_txt(
 
 
 # ============================================================
-# PERSISTENT CUSTOM IDS (must be unique per ticket)
+# CUSTOM IDS
 # ============================================================
 PANEL_SELECT_CID = "af_panel_select"
+
 
 def cid_close(channel_id: int) -> str:
     return f"af_close:{channel_id}"
 
+
 def cid_claim(channel_id: int) -> str:
     return f"af_claim:{channel_id}"
-
-def cid_priority(channel_id: int) -> str:
-    return f"af_priority:{channel_id}"
 
 
 # ============================================================
@@ -389,7 +422,7 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
             await interaction.response.send_message("Ticket channel not found.", ephemeral=True)
             return
 
-        await interaction.response.send_message("Closing ticket…", ephemeral=True)
+        await interaction.response.send_message("Closing ticket...", ephemeral=True)
         await close_ticket_flow(
             channel=ch,
             closed_by=f"{interaction.user} ({interaction.user.id})",
@@ -398,71 +431,12 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
 
 
 # ============================================================
-# PRIORITY SELECT (staff only)
-# ============================================================
-class PrioritySelect(discord.ui.Select):
-    def __init__(self, channel_id: int):
-        self.channel_id = channel_id
-        options = [
-            discord.SelectOption(label="Low", value="low", emoji="🟢"),
-            discord.SelectOption(label="Medium", value="medium", emoji="🟡"),
-            discord.SelectOption(label="High", value="high", emoji="🔴"),
-        ]
-        super().__init__(
-            placeholder="Set ticket priority…",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id=cid_priority(channel_id),
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Invalid context.", ephemeral=True)
-            return
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("Only staff can set priority.", ephemeral=True)
-            return
-
-        priority = self.values[0]
-
-        row = await db_fetchrow(
-            "SELECT owner_id, kind, ticket_num, status FROM tickets WHERE channel_id=$1",
-            self.channel_id
-        )
-        if not row or row["status"] != "open":
-            await interaction.response.send_message("Ticket not found or not open.", ephemeral=True)
-            return
-
-        await db_execute(
-            "UPDATE tickets SET priority=$1 WHERE channel_id=$2",
-            priority, self.channel_id
-        )
-
-        # rename channel (keep ORIGINAL creator!)
-        ch = interaction.guild.get_channel(self.channel_id)
-        if isinstance(ch, discord.TextChannel):
-            owner = interaction.guild.get_member(int(row["owner_id"])) or interaction.user
-            new_name = make_channel_name(str(row["kind"]), owner, int(row["ticket_num"]), priority)
-            try:
-                await ch.edit(name=new_name)
-            except Exception:
-                pass
-
-            await refresh_ticket_control_message(ch)
-
-        await interaction.response.send_message(f"✅ Priority set to **{priority.upper()}**.", ephemeral=True)
-
-
-# ============================================================
-# TICKET CONTROLS VIEW (persistent)
+# TICKET CONTROLS VIEW
 # ============================================================
 class TicketControlView(discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=None)
         self.channel_id = channel_id
-
-        self.add_item(PrioritySelect(channel_id))
 
         close_btn = discord.ui.Button(
             label="Close Ticket",
@@ -494,7 +468,7 @@ class TicketControlView(discord.ui.View):
             return
 
         row = await db_fetchrow(
-            "SELECT owner_id, kind, ticket_num, claimed_by, priority, status FROM tickets WHERE channel_id=$1",
+            "SELECT owner_id, kind, ticket_num, claimed_by, status FROM tickets WHERE channel_id=$1",
             self.channel_id
         )
         if not row or row["status"] != "open":
@@ -505,33 +479,32 @@ class TicketControlView(discord.ui.View):
             return
 
         await db_execute(
-            "UPDATE tickets SET claimed_by=$1 WHERE channel_id=$2",
+            "UPDATE tickets SET claimed_by=$1, last_activity=NOW() WHERE channel_id=$2",
             interaction.user.id, self.channel_id
         )
 
-        # keep channel name based on ORIGINAL creator
-        owner = interaction.guild.get_member(int(row["owner_id"]))
         ch = interaction.guild.get_channel(self.channel_id)
-        if owner and isinstance(ch, discord.TextChannel):
-            new_name = make_channel_name(str(row["kind"]), owner, int(row["ticket_num"]), row["priority"])
+        if isinstance(ch, discord.TextChannel):
             try:
-                await ch.edit(name=new_name)
-            except Exception:
-                pass
+                await hide_ticket_from_other_staff(ch, interaction.user)
+            except Exception as e:
+                print("Permission update failed:", e)
+
+            await ch.send(f"✅ Ticket claimed by {interaction.user.mention}.")
             await refresh_ticket_control_message(ch)
 
         await interaction.response.send_message("✅ Ticket claimed.", ephemeral=True)
 
 
 # ============================================================
-# PANEL SELECT VIEW (persistent)
+# PANEL SELECT VIEW
 # ============================================================
 class TicketPanelSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Claim Order", value="claim", description="Claim your order", emoji="📦"),
-            discord.SelectOption(label="Custom Order", value="custom", description="Request a custom order", emoji="🛒"),
-            discord.SelectOption(label="Issues/Help", value="support", description="Get help", emoji="🛠️"),
+            discord.SelectOption(label="Claim Order", value="claim", description="Claim your order", emoji="🛒"),
+            discord.SelectOption(label="Custom Order", value="custom", description="Request a custom order", emoji="🧾"),
+            discord.SelectOption(label="Issues/Help", value="support", description="Get help", emoji="🎫"),
         ]
         super().__init__(
             placeholder="Select a category...",
@@ -550,7 +523,6 @@ class TicketPanelSelect(discord.ui.Select):
         user = interaction.user
         kind = self.values[0]
 
-        # Only 1 open ticket per user per category
         existing = await db_fetchrow(
             "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND kind=$3 AND status='open'",
             guild.id, user.id, kind
@@ -563,7 +535,6 @@ class TicketPanelSelect(discord.ui.Select):
                 await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
             return
 
-        # Create channel
         cat_id = category_for_kind(kind)
         category = guild.get_channel(cat_id)
         if not isinstance(category, discord.CategoryChannel):
@@ -571,8 +542,7 @@ class TicketPanelSelect(discord.ui.Select):
             return
 
         num = await get_next_ticket_num(kind)
-        priority = None  # not set initially
-        channel_name = make_channel_name(kind, user, num, priority)
+        channel_name = make_channel_name(kind, user, num)
 
         staff_role = get_staff_role(guild)
         overwrites = {
@@ -589,7 +559,6 @@ class TicketPanelSelect(discord.ui.Select):
             reason="Ticket created"
         )
 
-        # Insert DB row
         await db_execute(
             """
             INSERT INTO tickets(channel_id, guild_id, owner_id, kind, ticket_num, status)
@@ -598,12 +567,10 @@ class TicketPanelSelect(discord.ui.Select):
             channel.id, guild.id, user.id, kind, num
         )
 
-        # Send control message
         embed = ticket_embed(
             kind=kind,
             owner_mention=user.mention,
             claimed_by_mention=None,
-            priority=None,
             first_staff_seconds=None,
             footer_text="AF SERVICES • Status: Waiting for staff"
         )
@@ -614,7 +581,6 @@ class TicketPanelSelect(discord.ui.Select):
             msg.id, channel.id
         )
 
-        # Register view persistently to this message
         bot.add_view(TicketControlView(channel.id), message_id=msg.id)
 
         await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
@@ -643,6 +609,83 @@ async def ticket_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=panel_embed(), view=TicketPanelView())
 
 
+@bot.tree.command(name="close", description="Close the current ticket.")
+@staff_only()
+@app_commands.describe(reason="Reason for closing this ticket")
+async def close_command(interaction: discord.Interaction, reason: str):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+
+    if not await is_ticket_channel(interaction.channel.id):
+        await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("Closing ticket...", ephemeral=True)
+    await close_ticket_flow(
+        channel=interaction.channel,
+        closed_by=f"{interaction.user} ({interaction.user.id})",
+        reason=reason,
+    )
+
+
+@bot.tree.command(name="rename", description="Rename the current ticket channel.")
+@staff_only()
+@app_commands.describe(text="New channel name")
+async def rename_command(interaction: discord.Interaction, text: str):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+
+    if not await is_ticket_channel(interaction.channel.id):
+        await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        return
+
+    new_name = sanitize_channel_rename(text)
+    try:
+        await interaction.channel.edit(name=new_name)
+        await interaction.response.send_message(f"✅ Channel renamed to `{new_name}`.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Rename failed: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="purge", description="Close tickets in bulk.")
+@staff_only()
+@app_commands.describe(target="Use 'all' to close all open tickets")
+@app_commands.choices(target=[app_commands.Choice(name="all", value="all")])
+async def purge_command(interaction: discord.Interaction, target: app_commands.Choice[str]):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    if target.value != "all":
+        await interaction.response.send_message("Invalid purge target.", ephemeral=True)
+        return
+
+    rows = await db_fetch(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND status='open'",
+        interaction.guild.id,
+    )
+    if not rows:
+        await interaction.response.send_message("No open tickets found.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"Closing {len(rows)} open ticket(s)...", ephemeral=True)
+
+    for row in rows:
+        ch = interaction.guild.get_channel(int(row["channel_id"]))
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await close_ticket_flow(
+                    channel=ch,
+                    closed_by=f"{interaction.user} ({interaction.user.id})",
+                    reason="Bulk purge: all open tickets",
+                )
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Failed to purge channel {ch.id}: {e}")
+
+
 @bot.tree.command(name="ticket_stats", description="Show ticket stats overview (server).")
 @staff_only()
 async def ticket_stats(interaction: discord.Interaction):
@@ -651,7 +694,6 @@ async def ticket_stats(interaction: discord.Interaction):
         await interaction.response.send_message("Use in a server.", ephemeral=True)
         return
 
-    # totals
     totals = await db_fetchrow(
         """
         SELECT
@@ -680,8 +722,7 @@ async def ticket_stats(interaction: discord.Interaction):
 
     avg_resp = await db_fetchrow(
         """
-        SELECT
-          AVG(first_staff_response_seconds)::float AS avg_first_response
+        SELECT AVG(first_staff_response_seconds)::float AS avg_first_response
         FROM tickets
         WHERE guild_id=$1 AND first_staff_response_seconds IS NOT NULL
         """,
@@ -689,18 +730,10 @@ async def ticket_stats(interaction: discord.Interaction):
     )
 
     avg_seconds = avg_resp["avg_first_response"]
-    if avg_seconds is None:
-        avg_text = "N/A"
-    else:
-        avg_seconds = int(avg_seconds)
-        avg_text = f"{avg_seconds // 60}m {avg_seconds % 60}s"
+    avg_text = "N/A" if avg_seconds is None else f"{int(avg_seconds) // 60}m {int(avg_seconds) % 60}s"
 
-    e = discord.Embed(
-        title="AF SERVICES • Ticket Stats",
-        color=AF_BLUE
-    )
+    e = discord.Embed(title="AF SERVICES • Ticket Stats", color=AF_BLUE)
     e.set_thumbnail(url=AF_LOGO_URL)
-
     e.add_field(name="Total tickets", value=str(totals["total"]), inline=True)
     e.add_field(name="Open", value=str(totals["open"] or 0), inline=True)
     e.add_field(name="Closed", value=str(totals["closed"] or 0), inline=True)
@@ -709,7 +742,7 @@ async def ticket_stats(interaction: discord.Interaction):
 
     lines = []
     for r in by_kind:
-        lines.append(f"**{kind_label(r['kind'])}** — total {r['total']}, open {r['open'] or 0}")
+        lines.append(f"**{kind_label(r['kind'])}**: total {r['total']}, open {r['open'] or 0}")
     e.add_field(name="By category", value="\n".join(lines) if lines else "No data", inline=False)
 
     await interaction.response.send_message(embed=e, ephemeral=True)
@@ -721,7 +754,7 @@ async def ticket_stats(interaction: discord.Interaction):
 async def refresh_ticket_control_message(channel: discord.TextChannel):
     row = await db_fetchrow(
         """
-        SELECT owner_id, kind, status, claimed_by, priority,
+        SELECT owner_id, kind, status, claimed_by,
                first_staff_response_seconds, control_message_id, last_footer_text
         FROM tickets WHERE channel_id=$1
         """,
@@ -743,9 +776,8 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
         kind=str(row["kind"]),
         owner_mention=owner_mention,
         claimed_by_mention=claimed_by_mention,
-        priority=row["priority"],
         first_staff_seconds=row["first_staff_response_seconds"],
-        footer_text=footer_text
+        footer_text=footer_text,
     )
 
     mid = row["control_message_id"]
@@ -764,56 +796,65 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
 
 
 # ============================================================
-# CLOSE FLOW: transcript -> countdown -> delete
+# CLOSE FLOW
 # ============================================================
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
-    # mark closed
+    row = await db_fetchrow(
+        "SELECT status, claimed_by FROM tickets WHERE channel_id=$1",
+        channel.id,
+    )
+    if not row or row["status"] != "open":
+        return
+
     await db_execute(
         "UPDATE tickets SET status='closed', last_activity=NOW() WHERE channel_id=$1",
         channel.id
     )
 
-    # transcript first
+    claimed_by = "Unclaimed"
+    if row["claimed_by"]:
+        claimer = channel.guild.get_member(int(row["claimed_by"]))
+        claimed_by = f"{claimer} ({claimer.id})" if claimer else str(int(row["claimed_by"]))
+
     transcript_sent = await send_transcript_txt(
         guild=channel.guild,
         ticket_channel=channel,
         close_reason=reason,
-        closed_by=closed_by
+        closed_by=closed_by,
+        claimed_by=claimed_by,
     )
 
-    # message in channel
     base = (
         f"🔒 **Ticket Closed**\n"
         f"Closed by: {closed_by}\n"
+        f"Claimed by: {claimed_by}\n"
         f"Reason: {reason}\n"
-        f"{'✅ Transcript saved.' if transcript_sent else '⚠️ Transcript failed (check log channel + permissions).'}\n\n"
-        f"🗑️ Deleting in {DELETE_COUNTDOWN_SECONDS} seconds…"
+        f"{'✅ Transcript saved.' if transcript_sent else '⚠️ Transcript failed.'}\n\n"
+        f"🗑️ Deleting in {DELETE_COUNTDOWN_SECONDS} seconds..."
     )
     countdown_msg = await channel.send(base)
 
-    # countdown edits
     for i in range(DELETE_COUNTDOWN_SECONDS - 1, 0, -1):
         await asyncio.sleep(1)
         try:
             await countdown_msg.edit(content=base.replace(
-                f"Deleting in {DELETE_COUNTDOWN_SECONDS} seconds…",
-                f"Deleting in {i} seconds…"
+                f"Deleting in {DELETE_COUNTDOWN_SECONDS} seconds...",
+                f"Deleting in {i} seconds..."
             ))
         except Exception:
             pass
 
     await asyncio.sleep(1)
 
-    # delete channel
     await db_execute("UPDATE tickets SET status='deleted' WHERE channel_id=$1", channel.id)
     try:
-        await channel.delete(reason="Ticket closed (auto delete after transcript).")
+        await channel.delete(reason="Ticket closed and deleted.")
     except Exception as e:
         print("Channel delete failed:", e)
 
 
 # ============================================================
-# FIRST STAFF RESPONSE TIME (DB ONLY) + activity update
+# FIRST STAFF RESPONSE + ACTIVITY
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -827,12 +868,11 @@ async def on_message(message: discord.Message):
         message.channel.id
     )
     if not row:
+        await bot.process_commands(message)
         return
 
-    # update last activity always (even though we removed inactivity close, this is still useful for stats later)
     await db_execute("UPDATE tickets SET last_activity=NOW() WHERE channel_id=$1", message.channel.id)
 
-    # first staff response stored ONLY in DB (no messages sent)
     if row["status"] == "open" and isinstance(message.author, discord.Member) and is_staff(message.author):
         if row["first_staff_response_seconds"] is None:
             created_at: datetime = row["created_at"]
@@ -841,33 +881,25 @@ async def on_message(message: discord.Message):
                 "UPDATE tickets SET first_staff_response_seconds=$1 WHERE channel_id=$2",
                 seconds, message.channel.id
             )
-            # update embed field
             await refresh_ticket_control_message(message.channel)
 
     await bot.process_commands(message)
 
 
 # ============================================================
-# ANIMATED STATUS (Method C: footer + topic)
+# STATUS ROTATOR
 # ============================================================
-def compute_status_strings(kind: str, claimed_by: int | None, priority: str | None, tick: int) -> tuple[str, str]:
-    """
-    Returns (footer_text, topic_text).
-    Rotate among a few phrases. Also reflect claimed/priority.
-    """
-    base_states = [
+def compute_status_strings(claimed_by: int | None, tick: int) -> tuple[str, str]:
+    states = [
         "Waiting for staff",
         "Processing",
         "AF SERVICES Support",
         "Please provide details",
     ]
-    state = base_states[tick % len(base_states)]
-
-    pr = (priority or "not set").upper()
+    state = states[tick % len(states)]
     claimed = "Claimed" if claimed_by else "Unclaimed"
-
-    footer = f"AF SERVICES • Status: {state} • {claimed} • Priority: {pr}"
-    topic = f"AF SERVICES Ticket | {claimed} | Priority: {pr} | {state}"
+    footer = f"AF SERVICES • Status: {state} • {claimed}"
+    topic = f"AF SERVICES Ticket | {claimed} | {state}"
     return footer, topic
 
 
@@ -879,7 +911,7 @@ async def status_rotator():
 
     rows = await db_fetch(
         """
-        SELECT channel_id, kind, claimed_by, priority, control_message_id, last_footer_text, last_topic_text
+        SELECT channel_id, claimed_by, last_footer_text, last_topic_text
         FROM tickets
         WHERE guild_id=$1 AND status='open'
         """,
@@ -894,14 +926,8 @@ async def status_rotator():
         if not isinstance(ch, discord.TextChannel):
             continue
 
-        footer_text, topic_text = compute_status_strings(
-            kind=str(r["kind"]),
-            claimed_by=r["claimed_by"],
-            priority=r["priority"],
-            tick=tick
-        )
+        footer_text, topic_text = compute_status_strings(r["claimed_by"], tick)
 
-        # Update channel topic only if changed (rate-limit friendly)
         if (r["last_topic_text"] or "") != topic_text:
             try:
                 await ch.edit(topic=topic_text)
@@ -909,20 +935,18 @@ async def status_rotator():
             except Exception:
                 pass
 
-        # Update embed footer only if changed
         if (r["last_footer_text"] or "") != footer_text:
             await db_execute("UPDATE tickets SET last_footer_text=$1 WHERE channel_id=$2", footer_text, channel_id)
             await refresh_ticket_control_message(ch)
 
 
 # ============================================================
-# READY: init DB, sync commands, register persistent views
+# READY
 # ============================================================
 @bot.event
 async def on_ready():
     await ensure_db()
 
-    # Sync slash commands to your guild (fast)
     try:
         gobj = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=gobj)
@@ -930,10 +954,8 @@ async def on_ready():
     except Exception as e:
         print("Command sync error:", e)
 
-    # persistent panel view
     bot.add_view(TicketPanelView())
 
-    # re-attach controls to existing open tickets
     rows = await db_fetch(
         "SELECT channel_id, control_message_id FROM tickets WHERE guild_id=$1 AND status='open' AND control_message_id IS NOT NULL",
         GUILD_ID
